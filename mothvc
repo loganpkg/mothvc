@@ -1,0 +1,536 @@
+#! /bin/sh
+
+#
+# Copyright (c) 2024 Logan Ryan McLintock
+#
+# Permission to use, copy, modify, and/or distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+#
+
+
+# mothvc: Moth Version Control.
+
+set -x
+set -e
+set -u
+
+
+vc_dir='.git'
+global_config="$HOME"/"$vc_dir"'config'
+head_path="$vc_dir"'/HEAD'
+
+
+hash_to_path() {
+    local hash
+    ############
+    local hash_start
+    local hash_end
+    ############
+    if [ "$#" -ne 1 ]
+    then
+        printf '%s: hash_to_path hash\n' "$0" 1>&2
+        return 1
+    fi
+    hash="$1"
+    ############
+    hash_start=$(printf '%s' "$1" | cut -c 1-2)
+    hash_end=$(printf '%s' "$1" | cut -c 3-40)
+    printf '%s' "$vc_dir"'/objects/'"$hash_start"/"$hash_end"
+}
+
+
+hash_file() {
+    local path
+    local type
+    local mode
+    ############
+    local tmp_obj
+    local size
+    local hash
+    local store_path
+    local store_dir
+    ############
+    if [ "$#" -ne 3 ]
+    then
+        printf '%s: hash_file path blob|tree|commit store|print\n' "$0" 1>&2
+        return 1
+    fi
+    path="$1"
+    type="$2"
+    mode="$3"
+    ############
+
+    tmp_obj="$(mktemp)"
+    size=$(stat -c '%s' "$path")
+    printf '%s %s\0' "$type" "$size" > "$tmp_obj"
+    cat "$path" >> "$tmp_obj"
+    hash=$(sha1sum "$tmp_obj" | cut -d ' ' -f 1)
+
+    if [ "$mode" = 'store' ]
+    then
+        store_path=$(hash_to_path "$hash")
+        if [ ! -e "$store_path" ]
+        then
+            store_dir=$(dirname "$store_path")
+            mkdir -p "$store_dir"
+            openssl zlib -in "$tmp_obj" -out "$store_path"
+        fi
+        printf '%s\n' "$hash"
+    elif [ "$mode" = 'print' ]
+    then
+        printf '%s\n' "$hash"
+    else
+        rm "$tmp_obj"
+        return 1
+    fi
+
+    rm "$tmp_obj"
+    return 0
+}
+
+
+branch_to_commit() {
+    # OK if branch is already a commit hash
+    local branch_or_commit
+    ############
+    local path
+    ############
+    if [ "$#" -ne 1 ]
+    then
+        printf '%s: branch_to_commit branch|commit\n' "$0" 1>&2
+        return 1
+    fi
+    branch_or_commit="$1"
+    ############
+    path="$vc_dir"'/refs/heads/'"$branch_or_commit"
+    if [ -s "$path" ]
+    then
+        cat "$path"
+    else
+        printf '%s\n' "$branch_or_commit"
+    fi
+}
+
+
+get_current_checkout() {
+    local v1
+    local v2
+    local ref
+    local commit_hash
+    ############
+    # No args
+    ############
+
+    commit_hash=''
+
+    IFS=':' read -r v1 v2 < "$head_path"
+
+    if [ "$v1" = 'ref' ]
+    then
+        ref=$(printf '%s' "$v2" | sed -E 's/^ +//')
+        if [ -e "$vc_dir/$ref" ]
+        then
+            commit_hash=$(cat "$vc_dir/$ref")
+        fi
+    else
+        commit_hash="$v1"
+    fi
+
+    printf '%s\n' "$commit_hash"
+    return 0
+}
+
+
+object_type() {
+    local hash
+    ############
+    local path
+    ############
+    if [ "$#" -ne 1 ]
+    then
+        printf '%s: object_type hash\n' "$0" 1>&2
+        return 1
+    fi
+    hash="$1"
+    ############
+
+    path=$(hash_to_path "$hash")
+    openssl zlib -d -in "$path" | tr '\0' '\n' | head -n 1 \
+        | sed -E 's/^([a-z]+) .*/\1/'
+}
+
+
+object_data() {
+    local hash
+    ############
+    local path
+    local header_size
+    ############
+    if [ "$#" -ne 1 ]
+    then
+        printf '%s: object_data hash\n' "$0" 1>&2
+        return 1
+    fi
+    hash="$1"
+    ############
+
+    path=$(hash_to_path "$hash")
+    header_size=$(openssl zlib -d -in "$path" | tr '\0' '\n' \
+        | head -n 1 | wc -c)
+
+    openssl zlib -d -in "$path" | dd bs=1 skip="$header_size"
+}
+
+
+walk_tree() {
+    local base_dir
+    local tree_hash
+    local operation
+    ############
+    local tree_path
+    local tmp
+    local type
+    local size
+    local perm
+    local fn
+    local hash
+    local f_hash
+    local path
+    ############
+    if [ "$#" -ne 3 ]
+    then
+        printf '%s: walk_tree base_dir tree_hash check|delete|copy\n' "$0" 1>&2
+        return 1
+    fi
+    base_dir="$1"
+    tree_hash="$2"
+    operation="$3"
+    ############
+
+    tree_path=$(hash_to_path "$tree_hash")
+
+    tmp="$(mktemp)"
+    openssl zlib -d -in "$tree_path" | tree_to_text > "$tmp"
+
+    exec 3< "$tmp"
+
+    IFS=':' read -r type size <&3
+    if [ "$type" != 'tree' ]
+    then
+        printf 'ERROR: Not a tree\n' 1>&2
+        return 1
+    fi
+
+    while IFS=':' read -r perm fn hash
+    do
+        path="$base_dir"/"$fn"
+        type=$(object_type "$hash")
+        if [ "$type" = 'tree' ]
+        then
+            if [ "$operation" = 'copy' ]
+            then
+                mkdir -p "$path"
+            fi
+            walk_tree "$path" "$hash" "$operation"
+            if [ "$operation" = 'delete' ]
+            then
+                rmdir "$path"
+            fi
+        else
+            if [ "$operation" = 'check' ]
+            then
+                f_hash=$(hash_file "$path" 'blob' 'print')
+                if [ "$f_hash" != "$hash" ]
+                then
+                    printf 'Modified file: %s\n' "$path"
+                    return 1
+                fi
+            elif [ "$operation" = 'delete' ]
+            then
+                rm "$path"
+            elif [ "$operation" = 'copy' ]
+            then
+                object_data "$hash" > "$path"
+            fi
+        fi
+    done <&3
+
+    exec 3<&-
+
+    rm "$tmp"
+    return 0
+}
+
+
+walk_dir() {
+    local dir
+    ############
+    local tmp
+    local tmp_tree
+    local tmp_tree_sorted
+    local tmp_tree_binary
+    local fn
+    local path
+    local perm
+    local hash
+    local orig_fn
+    ############
+    if [ "$#" -ne 1 ]
+    then
+        printf '%s: walk_dir dir\n' "$0" 1>&2
+        return 1
+    fi
+    dir="$1"
+    ############
+
+    tmp="$(mktemp)"
+    tmp_tree="$(mktemp)"
+    tmp_tree_sorted="$(mktemp)"
+    tmp_tree_binary="$(mktemp)"
+
+    find "$dir" -mindepth 1 -maxdepth 1 ! -path '*/'"$vc_dir" \
+        -exec basename '{}' \; | sed -E 's_^\./__' > "$tmp"
+
+    # Create tree in text format to make sorting easier,
+    # then convert to binary format.
+
+    while IFS='' read -r fn
+    do
+        path="$dir"/"$fn"
+        if [ -d "$path" ]
+        then
+             hash=$(walk_dir "$path")
+             # Add trailing forward slash for sort
+             printf '40000:%s/:' "$fn" >> "$tmp_tree"
+        else
+             # File
+             hash=$(hash_file "$path" 'blob' 'store')
+             printf '100644:%s:' "$fn" >> "$tmp_tree"
+        fi
+        printf '%s\n' "$hash" >> "$tmp_tree"
+    done < "$tmp"
+
+    LC_ALL=C sort -t ':' -k '2,2' "$tmp_tree" > "$tmp_tree_sorted"
+
+    # Convert to binary format
+    while IFS=':' read -r perm fn hash
+    do
+        orig_fn=$(printf '%s' "$fn" | sed -E 's@/$@@')
+        {
+        printf '%s %s\0' "$perm" "$orig_fn"
+        printf '%s' "$hash" | xxd -r -p
+        } >> "$tmp_tree_binary"
+    done < "$tmp_tree_sorted"
+
+    hash=$(hash_file "$tmp_tree_binary" 'tree' 'store')
+    printf '%s\n' "$hash"
+
+    rm "$tmp" "$tmp_tree" "$tmp_tree_sorted" "$tmp_tree_binary"
+    return 0
+}
+
+
+commit_to_tree() {
+    local commit_hash
+    ############
+    local commit_path
+    ############
+    if [ "$#" -ne 1 ]
+    then
+        printf '%s: commit_to_tree commit_hash\n' "$0" 1>&2
+        return 1
+    fi
+    commit_hash="$1"
+    ############
+
+    commit_path=$(hash_to_path "$commit_hash")
+    openssl zlib -d -in "$commit_path" | tr '\0' '\n' | grep -E 'tree ' \
+        | sed -E 's/^tree (.+)$/\1/'
+}
+
+
+get_name() {
+    ############
+    # No args
+    ############
+    grep -E -o 'name = .+$' "$global_config" | sed -E 's/name = //'
+}
+
+
+get_email() {
+    ############
+    # No args
+    ############
+    grep -E -o 'email = .+$' "$global_config" | sed -E 's/email = //'
+}
+
+
+commit() {
+    local message
+    local other_parent_hash
+    ############
+    local tmp_commit_file
+    ############
+    if [ "$#" -ne 2 ]
+    then
+        printf '%s: commit message other_parent_hash\n' "$0" 1>&2
+        return 1
+    fi
+    message="$1"
+    other_parent_hash="$2"
+    ############
+
+    tmp_commit_file="$(mktemp)"
+
+    tree_hash=$(walk_dir "$(pwd)")
+
+    author="$(get_name)"
+    email="$(get_email)"
+    parent="$(get_current_checkout)"
+    time="$(date '+%s')"
+
+    printf 'tree %s\n' "$tree_hash" > "$tmp_commit_file"
+
+    if [ -n "$parent" ]
+    then
+        printf 'parent %s\n' "$parent" >> "$tmp_commit_file"
+    fi
+
+    if [ "$other_parent_hash" != 'NULL' ]
+    then
+        printf 'parent %s\n' "$other_parent_hash" >> "$tmp_commit_file"
+    fi
+
+    {
+    printf 'author %s <%s> %s +1030\n' "$author" "$email" "$time"
+    printf 'committer %s <%s> %s +1030\n\n' "$author" "$email" "$time"
+    printf '%s\n' "$message"
+    } >> "$tmp_commit_file"
+
+    hash=$(hash_file "$tmp_commit_file" 'commit' 'store')
+
+    target="$head_path"
+
+    IFS=':' read -r v1 v2 < "$target"
+
+    if [ "$v1" = 'ref' ]
+    then
+        ref=$(printf '%s' "$v2" | sed -E 's/^ +//')
+        target="$vc_dir/$ref"
+    fi
+
+    printf '%s\n' "$hash" > "$target"~
+    mv "$target"~ "$target"
+
+    rm "$tmp_commit_file"
+}
+
+usage='Usage:
+    mothvc init
+    mothvc checkout branch|hash
+    mothvc commit message
+    mothvc merge ours|theirs branch|commit
+'
+
+############
+if [ "$#" -lt 1 ]
+then
+    printf "%s" "$usage" 1>&2
+    exit 1
+fi
+option="$1"
+############
+
+if [ "$option" = 'init' ]
+then
+    mkdir -p "$vc_dir"
+    printf 'ref: refs/heads/master\n' > "$head_path"
+    mkdir -p "$vc_dir"'/refs/heads'
+
+elif [ "$option" = 'checkout' ]
+then
+    ############
+    if [ "$#" -ne 2 ]
+    then
+        printf 'Usage: %s checkout branch|hash\n' "$0" 1>&2
+        exit 1
+    fi
+    branch_or_commit="$2"
+    ############
+
+    target_hash=$(branch_to_commit "$branch_or_commit")
+    target_tree_hash=$(commit_to_tree "$target_hash")
+
+    commit_hash="$(get_current_checkout)"
+    tree_hash=$(commit_to_tree "$commit_hash")
+
+    walk_tree "$(pwd)" "$tree_hash" 'check'
+    walk_tree "$(pwd)" "$tree_hash" 'delete'
+
+    walk_tree "$(pwd)" "$target_tree_hash" 'copy'
+
+    if [ "$branch_or_commit" = "$target_hash" ]
+    then
+        printf '%s\n' "$target_hash" > "$head_path"~
+        mv "$head_path"~ "$head_path"
+    else
+        printf 'ref: refs/heads/%s\n' "$branch_or_commit" > "$head_path"
+    fi
+
+elif [ "$option" = 'commit' ]
+then
+    ############
+    if [ "$#" -ne 2 ]
+    then
+        printf 'Usage: %s commit message\n' "$0" 1>&2
+        exit 1
+    fi
+    message="$2"
+    ############
+
+    commit "$message" 'NULL'
+
+elif [ "$option" = 'merge' ]
+then
+    ############
+    if [ "$#" -ne 3 ]
+    then
+        printf 'Usage: %s merge ours|theirs branch|commit\n' "$0" 1>&2
+        exit 1
+    fi
+    merge_option="$2"
+    branch_or_commit="$3"
+    ############
+
+    commit_hash="$(get_current_checkout)"
+    tree_hash=$(commit_to_tree "$commit_hash")
+
+    # Check for modifications
+    walk_tree "$(pwd)" "$tree_hash" 'check'
+
+    other_parent_hash=$(branch_to_commit "$branch_or_commit")
+    other_parent_tree_hash=$(commit_to_tree "$other_parent_hash")
+
+    if [ "$merge_option" = 'theirs' ]
+    then
+        walk_tree "$(pwd)" "$other_parent_tree_hash" 'copy'
+    elif [ "$merge_option" = 'ours' ]
+    then
+        walk_tree "$(pwd)" "$other_parent_tree_hash" 'copy'
+        walk_tree "$(pwd)" "$tree_hash" 'copy'
+    else
+        printf 'Invalid merge option\n' 1>&2
+        exit 1
+    fi
+
+    commit 'Merge' "$other_parent_hash"
+fi
