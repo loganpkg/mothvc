@@ -22,16 +22,38 @@ set -e
 set -u
 set -x
 
-cc tree_to_text.c
-rm a.out
+install_dir="$HOME"/bin
+flags='-ansi -g -Og -Wall -Wextra -pedantic'
 
-indent -nut -kr tree_to_text.c
-rm tree_to_text.c~
 
-cc -ansi -Wall -Wextra -pedantic tree_to_text.c -o tree_to_text
+if [ "$(uname)" = Linux ]
+then
+    indent=indent
+else
+    indent=gindent
+fi
+
+repo_dir=$(pwd)
+build_dir=$(mktemp -d)
+
+# Copy files
+find . -type f ! -path '*.git*' -exec cp -p '{}' "$build_dir" \;
+
+cd "$build_dir" || exit 1
+
+# Long lines
+find . -type f ! -path '*.git*' ! -name '*~' \
+    -exec grep -H -n -E '.{80}' '{}' \;
+
+"$indent" -nut -kr tree_to_text.c
+
+cc $flags tree_to_text.c -o tree_to_text
 
 shellcheck -e SC3043 -e SC2034 mothvc
 
-mv tree_to_text ~/bin
+mkdir -p "$install_dir"
 
-cp mothvc ~/bin
+mv tree_to_text mothvc "$install_dir"/
+
+# Update files
+find . -type f \( -name '*.h' -o -name '*.c' \) -exec cp -p '{}' "$repo_dir" \;

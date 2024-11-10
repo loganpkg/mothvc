@@ -18,13 +18,22 @@
  * tree_to_text: Converts a tree from binary to text format.
  */
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+
+#define BINARY_HASH_LEN 20
+#define HEADER_STR "tree "
+#define HEADER_LEN 5
 
 int main(int argc, char **argv)
 {
     int ret = 1;                /* Error by default */
+    char buf[HEADER_LEN + 1];
     int x;
+
     size_t i;
 
     if (argc != 1) {
@@ -33,19 +42,19 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Header */
-    /* tree */
-    while (1) {
-        x = getchar();
-        if (x == EOF) {
-            goto error;
-        } else if (x == ' ') {
-            putchar(':');
-            break;
-        } else {
-            putchar(x);
-        }
+    /* Header -- tree */
+    if (fread(buf, 1, HEADER_LEN, stdin) != HEADER_LEN)
+        goto error;
+
+    buf[HEADER_LEN] = '\0';
+
+    if (strcmp(buf, HEADER_STR)) {
+        fprintf(stderr, "%s: ERROR: Invalid tree header\n", *argv);
+        goto error;
     }
+
+    buf[HEADER_LEN - 1] = ':';
+    printf("%s", buf);
 
     /* Size */
     while (1) {
@@ -54,28 +63,33 @@ int main(int argc, char **argv)
             goto error;
         } else if (x == '\0') {
             break;
-        } else if (x == ':' || x == '\n') {
+        } else if (isdigit(x)) {
+            putchar(x);
+        } else {
             fprintf(stderr, "ERROR: Invalid character in size field\n");
             goto error;
-        } else {
-            putchar(x);
         }
     }
 
     putchar('\n');
 
     while (1) {
-        /* File permissions */
-        x = getchar();          /* Read first char only */
+        /* File permissions -- First char */
+        x = getchar();
         if (x == EOF) {
             break;              /* OK to be at the end of the file here */
         } else if (x == ' ') {
-            fprintf(stderr, "ERROR: Empty file permissions\n");
+            fprintf(stderr, "%s: ERROR: Empty file permissions\n", *argv);
             goto error;
-        } else {
+        } else if (isdigit(x)) {
             putchar(x);
+        } else {
+            fprintf(stderr, "%s: ERROR: Invalid file permissions\n",
+                    *argv);
+            goto error;
         }
 
+        /* File permissions -- Other chars */
         while (1) {
             x = getchar();
             if (x == EOF) {
@@ -83,8 +97,12 @@ int main(int argc, char **argv)
             } else if (x == ' ') {
                 putchar(':');
                 break;
-            } else {
+            } else if (isdigit(x)) {
                 putchar(x);
+            } else {
+                fprintf(stderr, "%s: ERROR: Invalid file permissions\n",
+                        *argv);
+                goto error;
             }
         }
 
@@ -97,15 +115,17 @@ int main(int argc, char **argv)
                 putchar(':');
                 break;
             } else if (x == ':' || x == '\n') {
-                fprintf(stderr, "ERROR: Invalid character in filename\n");
+                fprintf(stderr,
+                        "%s: ERROR: Filename "
+                        "has a semicolon or newline char\n", *argv);
                 goto error;
             } else {
                 putchar(x);
             }
         }
 
-        /* SHA1 hash */
-        for (i = 0; i < 20; ++i) {
+        /* SHA1 hash -- Convert binary to hex */
+        for (i = 0; i < BINARY_HASH_LEN; ++i) {
             x = getchar();
             if (x == EOF) {
                 goto error;
