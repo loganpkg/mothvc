@@ -49,7 +49,8 @@ find . -type f ! -path '*.git*' ! -name '*~' \
 
 cc $flags tree_to_text.c -o tree_to_text
 
-shellcheck -e SC3043 -e SC2034 mothvc
+shellcheck -e SC3043 mothvc
+shellcheck -e SC2086 install.sh
 
 mkdir -p "$install_dir"
 

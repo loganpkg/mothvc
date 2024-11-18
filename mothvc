@@ -29,10 +29,14 @@ vc_dir=.git
 global_config="$HOME/$vc_dir"config
 head_path="$vc_dir"/HEAD
 hash_prgm=sha1sum
+delim=':'
+nl='
+'
+null=$(printf a | tr a '\0')
 
 # Command substitution is used to remove the trailing \n
 hash_text_len=$(h=$(printf '' | "$hash_prgm" | cut -d ' ' -f 1); \
-    printf '%s' "$h" | wc -c)
+    printf %s "$h" | wc -c)
 
 
 hash_to_path() {
@@ -48,8 +52,8 @@ hash_to_path() {
     fi
     hash="$1"
     ############
-    hash_start=$(printf %s "$1" | cut -c 1-2)
-    hash_end=$(printf %s "$1" | cut -c 3-"$hash_text_len")
+    hash_start=$(printf %s "$hash" | cut -c 1-2)
+    hash_end=$(printf %s "$hash" | cut -c 3-"$hash_text_len")
     printf %s "$vc_dir/objects/$hash_start/$hash_end"
 }
 
@@ -68,6 +72,117 @@ get_hash() {
     "$hash_prgm" "$fn" | cut -d ' ' -f 1
 }
 
+var_add_header() {
+    local var
+    local type
+    ############
+    local size
+    local tmp_obj
+    ############
+    if [ "$#" -ne 2 ]
+    then
+        printf '%s: var_add_header var blob|tree|commit\n' "$0" 1>&2
+        return 1
+    fi
+    var="$1"
+    type="$2"
+    ############
+    size=$(printf %s "$var" | wc -c)
+    tmp_obj=$(mktemp)
+    printf '%s %s\0' "$type" "$size" > "$tmp_obj"
+    printf %s "$var" >> "$tmp_obj"
+    printf '%s\n' "$tmp_obj"
+}
+
+
+file_add_header() {
+    local path
+    local type
+    ############
+    local size
+    local tmp_obj
+    ############
+    if [ "$#" -ne 2 ]
+    then
+        printf '%s: file_add_header path blob|tree|commit\n' "$0" 1>&2
+        return 1
+    fi
+    path="$1"
+    type="$2"
+    ############
+    size=$(stat -c %s "$path")
+    tmp_obj=$(mktemp)
+    printf '%s %s\0' "$type" "$size" > "$tmp_obj"
+    cat "$path" >> "$tmp_obj"
+    printf '%s\n' "$tmp_obj"
+}
+
+
+hash_obj() {
+    local path
+    local mode
+    ############
+    local hash
+    local store_path
+    local store_dir
+    ############
+    if [ "$#" -ne 2 ]
+    then
+        printf '%s: hash_obj path store|print\n' "$0" 1>&2
+        return 1
+    fi
+    path="$1"
+    mode="$2"
+    ############
+
+    hash=$(get_hash "$path")
+
+    if [ "$mode" = store ]
+    then
+        store_path=$(hash_to_path "$hash")
+        if [ ! -e "$store_path" ]
+        then
+            store_dir=$(dirname "$store_path")
+            mkdir -p "$store_dir"
+            openssl zlib -in "$path" -out "$store_path"
+        fi
+        printf '%s\n' "$hash"
+    elif [ "$mode" = print ]
+    then
+        printf '%s\n' "$hash"
+    else
+        rm "$path"
+        return 1
+    fi
+
+    return 0
+}
+
+
+hash_var() {
+    local var
+    local type
+    local mode
+    ############
+    local tmp_obj
+    ############
+    if [ "$#" -ne 3 ]
+    then
+        printf '%s: hash_var var blob|tree|commit store|print\n' "$0" 1>&2
+        return 1
+    fi
+    var="$1"
+    type="$2"
+    mode="$3"
+    ############
+
+    tmp_obj=$(var_add_header "$var" "$type")
+
+    hash_obj "$tmp_obj" "$mode"
+
+    rm "$tmp_obj"
+}
+
 
 hash_file() {
     local path
@@ -75,10 +190,6 @@ hash_file() {
     local mode
     ############
     local tmp_obj
-    local size
-    local hash
-    local store_path
-    local store_dir
     ############
     if [ "$#" -ne 3 ]
     then
@@ -90,32 +201,11 @@ hash_file() {
     mode="$3"
     ############
 
-    tmp_obj=$(mktemp)
-    size=$(stat -c %s "$path")
-    printf '%s %s\0' "$type" "$size" > "$tmp_obj"
-    cat "$path" >> "$tmp_obj"
-    hash=$(get_hash "$tmp_obj")
+    tmp_obj=$(file_add_header "$path" "$type")
 
-    if [ "$mode" = store ]
-    then
-        store_path=$(hash_to_path "$hash")
-        if [ ! -e "$store_path" ]
-        then
-            store_dir=$(dirname "$store_path")
-            mkdir -p "$store_dir"
-            openssl zlib -in "$tmp_obj" -out "$store_path"
-        fi
-        printf '%s\n' "$hash"
-    elif [ "$mode" = print ]
-    then
-        printf '%s\n' "$hash"
-    else
-        rm "$tmp_obj"
-        return 1
-    fi
+    hash_obj "$tmp_obj" "$mode"
 
     rm "$tmp_obj"
-    return 0
 }
 
 
@@ -151,9 +241,7 @@ get_current_checkout() {
     # No args
     ############
 
-    commit_hash=''
-
-    IFS=':' read -r v1 v2 < "$head_path"
+    IFS="$delim" read -r v1 v2 < "$head_path"
 
     if [ "$v1" = ref ]
     then
@@ -161,6 +249,8 @@ get_current_checkout() {
         if [ -e "$vc_dir/$ref" ]
         then
             commit_hash=$(cat "$vc_dir/$ref")
+        else
+            return 1
         fi
     else
         commit_hash="$v1"
@@ -218,14 +308,14 @@ walk_tree() {
     local operation
     ############
     local tree_path
-    local tmp
-    local type
-    local size
+    local tree_v
+    local line
     local perm
     local fn
     local hash
-    local f_hash
     local path
+    local type
+    local f_hash
     ############
     if [ "$#" -ne 3 ]
     then
@@ -238,21 +328,15 @@ walk_tree() {
     ############
 
     tree_path=$(hash_to_path "$tree_hash")
+    tree_v=$(openssl zlib -d -in "$tree_path" | tree_to_text | tail -n +2)
 
-    tmp=$(mktemp)
-    openssl zlib -d -in "$tree_path" | tree_to_text > "$tmp"
-
-    exec 3< "$tmp"
-
-    IFS=':' read -r type size <&3
-    if [ "$type" != tree ]
-    then
-        printf 'ERROR: Not a tree\n' 1>&2
-        return 1
-    fi
-
-    while IFS=':' read -r perm fn hash
+    IFS="$nl"
+    for line in $tree_v
     do
+        perm=$(printf %s "$line" | cut -d "$delim" -f 1)
+        fn=$(printf %s "$line" | cut -d "$delim" -f 2)
+        hash=$(printf %s "$line" | cut -d "$delim" -f 3)
+
         path="$base_dir/$fn"
         type=$(object_type "$hash")
         if [ "$type" = tree ]
@@ -283,11 +367,8 @@ walk_tree() {
                 object_data "$hash" > "$path"
             fi
         fi
-    done <&3
+    done
 
-    exec 3<&-
-
-    rm "$tmp"
     return 0
 }
 
@@ -295,15 +376,15 @@ walk_tree() {
 walk_dir() {
     local dir
     ############
-    local tmp
-    local tmp_tree
-    local tmp_tree_sorted
-    local tmp_tree_binary
+    local list
     local fn
-    local path
-    local perm
     local hash
+    local tree
+    local tree_sorted
+    local line
+    local perm
     local orig_fn
+    local tree_binary
     ############
     if [ "$#" -ne 1 ]
     then
@@ -313,49 +394,49 @@ walk_dir() {
     dir="$1"
     ############
 
-    tmp=$(mktemp)
-    tmp_tree=$(mktemp)
-    tmp_tree_sorted=$(mktemp)
-    tmp_tree_binary=$(mktemp)
-
-    find "$dir" -mindepth 1 -maxdepth 1 ! -path '*/'"$vc_dir" \
-        -exec basename '{}' \; | sed -E 's_^\./__' > "$tmp"
+    list=$(find "$dir" -mindepth 1 -maxdepth 1 ! -path '*/'"$vc_dir" \
+        -exec basename '{}' \; | sed -E 's_^\./__')
 
     # Create tree in text format to make sorting easier,
     # then convert to binary format.
 
-    while IFS='' read -r fn
+    tree=''
+    IFS="$nl"
+    for fn in $list
     do
         path="$dir/$fn"
         if [ -d "$path" ]
         then
              hash=$(walk_dir "$path")
              # Add trailing forward slash for sort
-             printf '40000:%s/:' "$fn" >> "$tmp_tree"
+             tree="$tree"40000:"$fn"/:
         else
              # File
              hash=$(hash_file "$path" blob store)
-             printf '100644:%s:' "$fn" >> "$tmp_tree"
+             tree="$tree"100644:"$fn":
         fi
-        printf '%s\n' "$hash" >> "$tmp_tree"
-    done < "$tmp"
+        tree="$tree$hash$nl"
+    done
 
-    LC_ALL=C sort -t ':' -k '2,2' "$tmp_tree" > "$tmp_tree_sorted"
+    LC_ALL=C tree_sorted=$(printf %s "$tree" | sort -t "$delim" -k 2,2)
 
     # Convert to binary format
-    while IFS=':' read -r perm fn hash
+    tree_binary=''
+    IFS="$nl"
+    for line in $tree_sorted
     do
-        orig_fn=$(printf %s "$fn" | sed -E 's@/$@@')
-        {
-        printf '%s %s\0' "$perm" "$orig_fn"
-        printf %s "$hash" | xxd -r -p
-        } >> "$tmp_tree_binary"
-    done < "$tmp_tree_sorted"
+        perm=$(print %s "$line" | cut -d "$delim" -f 1)
+        fn=$(print %s "$line" | cut -d "$delim" -f 2)
+        hash=$(print %s "$line" | cut -d "$delim" -f 3)
 
-    hash=$(hash_file "$tmp_tree_binary" tree store)
+        orig_fn=$(printf %s "$fn" | sed -E 's@/$@@')
+        tree_binary="$tree_binary$perm $orig_fn$null"
+        tree_binary="$tree_binary"$(printf %s "$hash" | xxd -r -p)
+    done
+
+    hash=$(hash_var "$tree_binary" tree store)
     printf '%s\n' "$hash"
 
-    rm "$tmp" "$tmp_tree" "$tmp_tree_sorted" "$tmp_tree_binary"
     return 0
 }
 
@@ -400,6 +481,7 @@ commit() {
     local other_parent_hash
     ############
     local tmp_commit_file
+    local bad_ch_count
     ############
     if [ "$#" -ne 2 ]
     then
@@ -412,10 +494,11 @@ commit() {
 
     tmp_commit_file=$(mktemp)
 
-    if find . -type f ! -path '*/.git/*' \( -path '*:*' -o -path '*
-*' \)
+    bad_ch_count=$(find . -type f ! -path '*/.git/*' -print0 \
+        | tr "$delim" '\n' | wc -l)
+    if [ "$bad_ch_count" -ne 0 ]
     then
-        printf '%s: ERROR: File path contains a semicolon or newline char\n' \
+        printf '%s: ERROR: File path contains a delimiter or newline char\n' \
             "$0" 1>&2
         return 1
     fi
@@ -452,11 +535,11 @@ commit() {
 
     target="$head_path"
 
-    IFS=':' read -r v1 v2 < "$target"
+    IFS="$delim" read -r v1 v2 < "$target"
 
     if [ "$v1" = ref ]
     then
-        ref=$(printf '%s' "$v2" | sed -E 's/^ +//')
+        ref=$(printf %s "$v2" | sed -E 's/^ +//')
         target="$vc_dir/$ref"
     fi
 
@@ -467,6 +550,33 @@ commit() {
 }
 
 
+list_ancestors() {
+    local commit_hash
+    local commit_path
+    local p
+    ############
+    local commit_path
+    ############
+    if [ "$#" -ne 1 ]
+    then
+        printf '%s: list_ancestors commit_hash\n' "$0" 1>&2
+        return 1
+    fi
+    commit_hash="$1"
+    ############
+
+    commit_path=$(hash_to_path "$commit_hash")
+    parents=$(openssl zlib -d -in "$commit_path" | tr '\0' '\n' \
+        | grep -E 'parent ' | sed -E 's/^parent (.+)$/\1/')
+
+    for p in $parents
+    do
+        printf '%s\n' "$p"
+        list_ancestors "$p"
+    done
+
+    return 0
+}
 
 
 usage='Usage:
@@ -492,7 +602,7 @@ fi
 ############
 if [ "$#" -lt 1 ]
 then
-    printf "%s" "$usage" 1>&2
+    printf %s "$usage" 1>&2
     exit 1
 fi
 option="$1"
@@ -602,4 +712,9 @@ then
     then
         find "$vc_dir"/refs/heads/ -type f -exec basename '{}' \;
     fi
+
+elif [ "$option" = test ]
+then
+    commit_hash=$(get_current_checkout)
+    list_ancestors "$commit_hash"
 fi
